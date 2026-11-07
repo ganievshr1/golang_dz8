@@ -13,8 +13,8 @@ import (
 	"example.com/finance-services/ledger"
 )
 
-func newHandler() http.Handler {
-	return api.NewHandler(log.Default())
+func newHandler(svc ledger.Service) http.Handler {
+	return api.NewHandler(svc, log.Default())
 }
 
 func main() {
@@ -30,14 +30,15 @@ func run() error {
 	)
 	defer stop()
 
-	if err := ledger.Connect(ctx); err != nil {
+	svc, closeFn, err := ledger.New(ctx)
+	if err != nil {
 		return err
 	}
-	defer ledger.Close()
+	defer closeFn()
 
 	server := &http.Server{
 		Addr:              ":8080",
-		Handler:           newHandler(),
+		Handler:           newHandler(svc),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
 		WriteTimeout:      10 * time.Second,

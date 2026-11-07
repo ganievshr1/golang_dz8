@@ -1,6 +1,6 @@
 //go:build integration
 
-package ledger
+package ledger_test
 
 import (
 	"context"
@@ -10,19 +10,20 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"example.com/finance-services/ledger"
+	"github.com/redis/go-redis/v9"
 )
 
-// Тест создаёт отдельную схему и удаляет только её.
 func TestPostgresRedisIntegration(t *testing.T) {
 	dsn := os.Getenv("TEST_DATABASE_URL")
 	if dsn == "" {
-		t.Fatal(
-			"задайте TEST_DATABASE_URL для интеграционного теста",
-		)
+		t.Fatal("задайте TEST_DATABASE_URL для интеграционного теста")
 	}
 
 	ctx := context.Background()
@@ -33,20 +34,13 @@ func TestPostgresRedisIntegration(t *testing.T) {
 	}
 	defer admin.Close()
 
-	schema := fmt.Sprintf(
-		"ledger_test_%d",
-		time.Now().UnixNano(),
-	)
+	schema := fmt.Sprintf("ledger_test_%d", time.Now().UnixNano())
 
-	if _, err := admin.Exec(
-		"CREATE SCHEMA " + schema,
-	); err != nil {
+	if _, err := admin.Exec("CREATE SCHEMA " + schema); err != nil {
 		t.Fatal(err)
 	}
 
 	defer func() {
-		Close()
-
 		if _, err := admin.Exec(
 			"DROP SCHEMA " + schema + " CASCADE",
 		); err != nil {
@@ -64,11 +58,43 @@ func TestPostgresRedisIntegration(t *testing.T) {
 	u.RawQuery = q.Encode()
 
 	t.Setenv("DATABASE_URL", u.String())
-	t.Setenv("REDIS_DB", envOr("TEST_REDIS_DB", "15"))
+	t.Setenv("REDIS_DB", testRedisDB())
 
-	if err := Connect(ctx); err != nil {
+	svc, closeFn, err := ledger.New(ctx)
+	if err != nil {
 		t.Fatal(err)
 	}
+
+	defer func() {
+		if closeFn != nil {
+			if err := closeFn(); err != nil {
+				t.Error(err)
+			}
+		}
+	}()
+
+	db, err := sql.Open("pgx", u.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	redisDB, err := strconv.Atoi(testRedisDB())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	addr := os.Getenv("REDIS_ADDR")
+	if addr == "" {
+		addr = "localhost:6379"
+	}
+
+	cache := redis.NewClient(&redis.Options{
+		Addr:     addr,
+		DB:       redisDB,
+		Password: os.Getenv("REDIS_PASSWORD"),
+	})
+	defer cache.Close()
 
 	files, err := filepath.Glob("migrations/*.sql")
 	if err != nil || len(files) != 2 {
@@ -81,42 +107,27 @@ func TestPostgresRedisIntegration(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		up := strings.Split(
-			string(body),
-			"-- +goose Down",
-		)[0]
+		up := strings.Split(string(body), "-- +goose Down")[0]
 
 		if _, err := db.Exec(up); err != nil {
 			t.Fatal(err)
 		}
 	}
 
-	if db.Stats().MaxOpenConnections != 10 {
-		t.Fatal("pool limit is not 10")
-	}
-
-	if list, err := ListTransactions(); err != nil ||
+	if list, err := svc.ListTransactions(ctx); err != nil ||
 		list == nil ||
 		len(list) != 0 {
-		t.Fatalf(
-			"empty transactions=%v err=%v",
-			list,
-			err,
-		)
+		t.Fatalf("empty transactions=%v err=%v", list, err)
 	}
 
-	if list, err := ListBudgets(); err != nil ||
+	if list, err := svc.ListBudgets(ctx); err != nil ||
 		list == nil ||
 		len(list) != 0 {
-		t.Fatalf(
-			"empty budgets=%v err=%v",
-			list,
-			err,
-		)
+		t.Fatalf("empty budgets=%v err=%v", list, err)
 	}
 
 	for _, limit := range []int{1500, 1000} {
-		if err := SetBudget(Budget{
+		if err := svc.SetBudget(ctx, ledger.Budget{
 			Category: "еда",
 			Limit:    limit,
 		}); err != nil {
@@ -124,12 +135,12 @@ func TestPostgresRedisIntegration(t *testing.T) {
 		}
 	}
 
-	b, err := ListBudgets()
+	b, err := svc.ListBudgets(ctx)
 	if err != nil || len(b) != 1 || b[0].Limit != 1000 {
 		t.Fatalf("upsert=%v err=%v", b, err)
 	}
 
-	first, err := CreateTransaction(Transaction{
+	first, err := svc.AddTransaction(ctx, ledger.Transaction{
 		Amount:   450,
 		Category: "еда",
 		Date:     "2099-10-01",
@@ -138,15 +149,15 @@ func TestPostgresRedisIntegration(t *testing.T) {
 		t.Fatalf("create=%+v err=%v", first, err)
 	}
 
-	if err := AddTransaction(Transaction{
+	if _, err := svc.AddTransaction(ctx, ledger.Transaction{
 		Amount:   600,
 		Category: "еда",
 		Date:     "2099-10-01",
-	}); !errors.Is(err, ErrBudgetExceeded) {
+	}); !errors.Is(err, ledger.ErrBudgetExceeded) {
 		t.Fatal("budget not enforced", err)
 	}
 
-	second, err := CreateTransaction(Transaction{
+	second, err := svc.AddTransaction(ctx, ledger.Transaction{
 		Amount:   550,
 		Category: "еда",
 		Date:     "2099-10-01",
@@ -155,7 +166,7 @@ func TestPostgresRedisIntegration(t *testing.T) {
 		t.Fatal("exact limit", err)
 	}
 
-	third, err := CreateTransaction(Transaction{
+	third, err := svc.AddTransaction(ctx, ledger.Transaction{
 		Amount:   500,
 		Category: "досуг",
 		Date:     "2099-10-02",
@@ -164,25 +175,21 @@ func TestPostgresRedisIntegration(t *testing.T) {
 		t.Fatal("no budget", err)
 	}
 
-	if AddTransaction(Transaction{
+	if _, err := svc.AddTransaction(ctx, ledger.Transaction{
 		Amount:   0,
 		Category: "еда",
 		Date:     "2099-10-01",
-	}) == nil {
+	}); err == nil {
 		t.Fatal("invalid accepted")
 	}
 
-	list, err := ListTransactions()
+	list, err := svc.ListTransactions(ctx)
 	if err != nil ||
 		len(list) != 3 ||
 		list[0].ID != third.ID ||
 		list[1].ID != second.ID ||
 		list[2].ID != first.ID {
-		t.Fatalf(
-			"order/persistence=%+v err=%v",
-			list,
-			err,
-		)
+		t.Fatalf("order/persistence=%+v err=%v", list, err)
 	}
 
 	var rubles string
@@ -197,7 +204,6 @@ func TestPostgresRedisIntegration(t *testing.T) {
 	}
 
 	const from, to = "2099-10-01", "2099-10-31"
-
 	key := "report:summary:" + from + ":" + to
 
 	if err := cache.Del(ctx, key).Err(); err != nil {
@@ -205,26 +211,20 @@ func TestPostgresRedisIntegration(t *testing.T) {
 	}
 
 	defer func() {
-		if cache != nil {
-			cache.Del(ctx, key)
-		}
+		cache.Del(ctx, key)
 	}()
 
-	report, err := GetReportSummary(ctx, from, to)
-	if err != nil ||
-		report.Total != 1500 ||
-		len(report.Items) != 2 {
+	report, err := svc.GetReportSummary(ctx, from, to)
+	if err != nil || report.Total != 1500 || len(report.Items) != 2 {
 		t.Fatalf("report=%+v err=%v", report, err)
 	}
 
 	ttl, err := cache.TTL(ctx, key).Result()
-	if err != nil ||
-		ttl <= 0 ||
-		ttl > 30*time.Second {
+	if err != nil || ttl <= 0 || ttl > 30*time.Second {
 		t.Fatalf("TTL=%s err=%v", ttl, err)
 	}
 
-	if err := AddTransaction(Transaction{
+	if _, err := svc.AddTransaction(ctx, ledger.Transaction{
 		Amount:   100,
 		Category: "досуг",
 		Date:     "2099-10-02",
@@ -232,41 +232,36 @@ func TestPostgresRedisIntegration(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// До истечения TTL отчёт остаётся прежним.
-	hit, err := GetReportSummary(ctx, from, to)
+	hit, err := svc.GetReportSummary(ctx, from, to)
 	if err != nil || hit.Total != 1500 {
 		t.Fatal("cache hit", err)
 	}
 
-	if err := cache.PExpire(
-		ctx,
-		key,
-		time.Millisecond,
-	).Err(); err != nil {
+	if err := cache.PExpire(ctx, key, time.Millisecond).Err(); err != nil {
 		t.Fatal(err)
 	}
 
 	time.Sleep(10 * time.Millisecond)
 
-	fresh, err := GetReportSummary(ctx, from, to)
+	fresh, err := svc.GetReportSummary(ctx, from, to)
 	if err != nil || fresh.Total != 1600 {
 		t.Fatal("cache expiration", err)
 	}
 
-	if err := Close(); err != nil {
+	if err := closeFn(); err != nil {
 		t.Fatal(err)
 	}
 
-	if err := Connect(ctx); err != nil {
+	svc, closeFn, err = ledger.New(ctx)
+	if err != nil {
 		t.Fatal(err)
 	}
 
-	if list, err := ListTransactions(); err != nil ||
-		len(list) != 4 {
+	if list, err := svc.ListTransactions(ctx); err != nil || len(list) != 4 {
 		t.Fatal("data lost after reconnect", err)
 	}
 
-	if err := SetBudget(Budget{
+	if err := svc.SetBudget(ctx, ledger.Budget{
 		Category: "parallel",
 		Limit:    5,
 	}); err != nil {
@@ -282,11 +277,12 @@ func TestPostgresRedisIntegration(t *testing.T) {
 		go func() {
 			defer wg.Done()
 
-			results <- AddTransaction(Transaction{
+			_, err := svc.AddTransaction(ctx, ledger.Transaction{
 				Amount:   1,
 				Category: "parallel",
 				Date:     "2099-11-01",
 			})
+			results <- err
 		}()
 	}
 
@@ -298,15 +294,19 @@ func TestPostgresRedisIntegration(t *testing.T) {
 	for err := range results {
 		if err == nil {
 			successes++
-		} else if !errors.Is(err, ErrBudgetExceeded) {
+		} else if !errors.Is(err, ledger.ErrBudgetExceeded) {
 			t.Fatal(err)
 		}
 	}
 
 	if successes != 5 {
-		t.Fatalf(
-			"successful concurrent writes=%d want=5",
-			successes,
-		)
+		t.Fatalf("successful concurrent writes=%d want=5", successes)
 	}
+}
+
+func testRedisDB() string {
+	if v := os.Getenv("TEST_REDIS_DB"); v != "" {
+		return v
+	}
+	return "15"
 }

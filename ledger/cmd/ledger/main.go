@@ -9,12 +9,6 @@ import (
 	"example.com/finance-services/ledger"
 )
 
-func main() {
-	if err := run(); err != nil {
-		log.Fatal(err)
-	}
-}
-
 func run() error {
 	ctx, stop := signal.NotifyContext(
 		context.Background(),
@@ -22,16 +16,22 @@ func run() error {
 	)
 	defer stop()
 
-	if err := ledger.Connect(ctx); err != nil {
+	_, closeFn, err := ledger.New(ctx)
+	if err != nil {
 		return err
 	}
-	defer ledger.Close()
+	defer closeFn()
 
 	log.Print(
-		"Ledger готов. Данные хранятся в PostgreSQL. Остановка: Ctrl+C",
+		"Ledger готов. Для HTTP запустите Gateway. Ctrl+C — выход.",
 	)
 
 	<-ctx.Done()
-
 	return nil
+}
+
+func main() {
+	if err := run(); err != nil {
+		log.Fatal(err)
+	}
 }

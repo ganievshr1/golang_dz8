@@ -1,138 +1,60 @@
 # Gateway
 
-Gateway предоставляет HTTP API на :8080.
-Он импортирует локальный модуль Ledger через require и replace.
+HTTP API на порту 8080.
 
-Ledger хранит данные в PostgreSQL.
-Отчёты кешируются в Redis на 30 секунд.
-Контракты бюджетов и транзакций сохранены.
+Gateway импортирует публичный пакет ledger и получает готовый сервис:
 
-## Подготовка и запуск
-
-Нужны Go 1.23+, Docker Desktop и Goose.
-
-Из корня finance-services:
-
-```powershell
-docker compose up -d --wait
-
-$env:DATABASE_URL = 'postgres://postgres:postgres@127.0.0.1:15432/cashapp?sslmode=disable'
-$env:REDIS_ADDR = 'localhost:6379'
-$env:REDIS_DB = '0'
-$env:REDIS_PASSWORD = ''
-
-go install github.com/pressly/goose/v3/cmd/goose@v3.24.1
-
-$goose = Join-Path (go env GOPATH) 'bin\goose.exe'
-
-& $goose -dir ./ledger/migrations postgres "$env:DATABASE_URL" up
-if ($LASTEXITCODE -ne 0) {
-    throw 'Не применились миграции'
+```go
+svc, closeFn, err := ledger.New(ctx)
+if err != nil {
+    return err
 }
+defer closeFn()
 
-cd gateway
-go mod tidy
-go run .
+handler := api.NewHandler(svc, logger)
 ```
 
-Compose создаёт БД cashapp и запускает PostgreSQL/Redis.
+Обработчики используют интерфейс ledger.Service.
+Прямых импортов database/sql, pgx и repository нет.
 
-Gateway вызывает ledger.Connect в собственном процессе.
-Консольная команда Ledger не является отдельным HTTP-сервером.
+DTO, маршруты, коды ответов и JSON-контракты сохранены.
+Валидация сущностей и бюджетное правило выполняются в Ledger.
 
-Для запуска консольного Ledger используйте go run ./cmd/ledger
-из каталога ledger с теми же переменными окружения.
+Gateway преобразует ошибки:
 
-Переменные нужно задавать в каждом новом терминале.
+- ValidationError — 400;
+- ErrInvalidPeriod — 400;
+- ErrBudgetExceeded — 409;
+- внутренняя ошибка — 500.
 
-Откат последней миграции из корня:
-
-```powershell
-& $goose -dir ./ledger/migrations postgres "$env:DATABASE_URL" down
-```
-
-Откат удаляет таблицу expenses и её данные.
-Полный down-to 0 удаляет также budgets.
+Все ответы имеют Content-Type: application/json; charset=utf-8.
+Ошибки имеют формат {"error":"..."}.
 
 ## Эндпоинты
 
-| Метод | Путь | Успех |
-|---|---|---|
-| POST | /api/budgets | 201 и бюджет |
-| GET | /api/budgets | 200 и массив |
-| POST | /api/transactions | 201 и транзакция с ID |
-| GET | /api/transactions | 200 и массив |
-| GET | /api/reports/summary?from=YYYY-MM-DD&to=YYYY-MM-DD | 200 и отчёт |
-| GET | /ping | 200 и {"message":"pong"} |
+- GET /ping;
+- GET/POST /api/budgets;
+- GET/POST /api/transactions;
+- GET /api/reports/summary?from=YYYY-MM-DD&to=YYYY-MM-DD.
 
-Пустые списки возвращаются как [].
+## Запуск и тестирование
 
-Суммы API — целые копейки.
-Нулевые и отрицательные суммы/лимиты запрещены.
+Подготовка PostgreSQL/Redis, миграции, env и примеры cURL:
+[корневой README](../README.md).
 
-Ответы: application/json; charset=utf-8.
-
-Ошибки:
-
-- 400 — JSON, валидация или период;
-- 409 — {"error":"budget exceeded"};
-- 500 — {"error":"internal server error"};
-- 404 — неизвестный путь;
-- 405 — неподдерживаемый метод.
-
-Подробности внутренних ошибок записываются в лог.
-
-## Проверка через cURL
-
-Во втором терминале PowerShell:
+После настройки env из корня проекта:
 
 ```powershell
-$OutputEncoding = [System.Text.UTF8Encoding]::new($false)
-$category = 'еда-' + (Get-Date -Format 'yyyyMMdd-HHmmss')
-$api = 'http://localhost:8080/api'
-
-@{ category=$category; limit=1000 } | ConvertTo-Json -Compress | curl.exe -i -X POST "$api/budgets" -H 'Content-Type: application/json' --data-binary '@-'
-
-@{ amount=450; category=$category; description='ланч'; date='2026-10-30' } | ConvertTo-Json -Compress | curl.exe -i -X POST "$api/transactions" -H 'Content-Type: application/json' --data-binary '@-'
-
-@{ amount=600; category=$category; date='2026-10-30' } | ConvertTo-Json -Compress | curl.exe -i -X POST "$api/transactions" -H 'Content-Type: application/json' --data-binary '@-'
-
-curl.exe -i "$api/transactions"
-curl.exe -i "$api/budgets"
-
-curl.exe -i "$api/reports/summary?from=2026-10-01&to=2026-10-31"
-curl.exe -i "$api/reports/summary?from=2026-10-01&to=2026-10-31"
-```
-
-Ожидаемые статусы:
-201, 201, 409, 200, 200, 200, 200.
-
-В новой категории сохраняется только транзакция на 450 копеек.
-На новой БД total отчёта равен 450.
-
-Для незакешированного периода первый запрос пишет cache miss,
-следующий — cache hit.
-Если ключ уже существовал, дождитесь истечения 30 секунд.
-
-При новой записи отчёт обновляется после TTL.
-Списки читаются из PostgreSQL сразу.
-
-## Проверка сохранности
-
-Остановите Gateway и консольный Ledger через Ctrl+C.
-Запустите их повторно с тем же DATABASE_URL.
-
-GET /api/transactions и GET /api/budgets должны вернуть
-прежние записи и ID.
-
-## Тесты
-
-В каталоге gateway:
-
-```powershell
-go test -count=1 -v -cover ./...
+Push-Location gateway
+go test -count=1 -cover ./...
 go vet ./...
+go run .
+Pop-Location
 ```
 
-Полная проверка PostgreSQL/Redis и команды Git
-приведены в корневом README.md.
+Отдельный процесс Ledger для HTTP не требуется:
+Gateway создаёт сервис в своём процессе.
+
+После Ctrl+C и повторного запуска записи и ID должны сохраниться.
+Отчёты кэшируются на 30 секунд.
+Логи cache miss/hit появляются в процессе Gateway.

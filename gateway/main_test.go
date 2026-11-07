@@ -13,36 +13,18 @@ func TestGatewayRouting(t *testing.T) {
 		body   string
 		status int
 	}{
-		{
-			"GET",
-			"/ping",
-			`{"message":"pong"}`,
-			200,
-		},
-		{
-			"GET",
-			"/missing",
-			`{"error":"not found"}`,
-			404,
-		},
-		{
-			"POST",
-			"/ping",
-			`{"error":"method not allowed"}`,
-			405,
-		},
+		{"GET", "/ping", `{"message":"pong"}`, 200},
+		{"GET", "/missing", `{"error":"not found"}`, 404},
+		{"POST", "/ping", `{"error":"method not allowed"}`, 405},
 	}
 
 	for _, tc := range tests {
 		w := httptest.NewRecorder()
 
-		newHandler().ServeHTTP(
+		// Эти маршруты не обращаются к сервису.
+		newHandler(nil).ServeHTTP(
 			w,
-			httptest.NewRequest(
-				tc.method,
-				tc.path,
-				nil,
-			),
+			httptest.NewRequest(tc.method, tc.path, nil),
 		)
 
 		if w.Code != tc.status ||

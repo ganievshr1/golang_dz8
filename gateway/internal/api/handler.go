@@ -15,36 +15,29 @@ const jsonContentType = "application/json; charset=utf-8"
 const maxBodyBytes = 1 << 20
 
 type handler struct {
-	store  store
-	logger *log.Logger
+	service ledger.Service
+	logger  *log.Logger
 }
 
-func NewHandler(logger *log.Logger) http.Handler {
-	return newHandler(ledgerStore{}, logger)
-}
-
-func newHandler(s store, logger *log.Logger) http.Handler {
+func NewHandler(s ledger.Service, logger *log.Logger) http.Handler {
 	if logger == nil {
 		logger = log.Default()
 	}
 
 	return Logging(logger)(&handler{
-		store:  s,
-		logger: logger,
+		service: s,
+		logger:  logger,
 	})
 }
 
-func (h *handler) ServeHTTP(
-	w http.ResponseWriter,
-	r *http.Request,
-) {
+func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch r.URL.Path {
 	case "/api/transactions":
 		switch r.Method {
 		case http.MethodPost:
 			h.createTransaction(w, r)
 		case http.MethodGet:
-			h.listTransactions(w)
+			h.listTransactions(w, r)
 		default:
 			methodNotAllowed(w, "GET, POST")
 		}
@@ -54,7 +47,7 @@ func (h *handler) ServeHTTP(
 		case http.MethodPost:
 			h.createBudget(w, r)
 		case http.MethodGet:
-			h.listBudgets(w)
+			h.listBudgets(w, r)
 		default:
 			methodNotAllowed(w, "GET, POST")
 		}
@@ -65,23 +58,13 @@ func (h *handler) ServeHTTP(
 			return
 		}
 
-		result, err := h.store.GetReportSummary(
+		result, err := h.service.GetReportSummary(
 			r.Context(),
 			r.URL.Query().Get("from"),
 			r.URL.Query().Get("to"),
 		)
-
-		if errors.Is(err, ledger.ErrInvalidPeriod) {
-			writeError(
-				w,
-				http.StatusBadRequest,
-				err.Error(),
-			)
-			return
-		}
-
 		if err != nil {
-			h.internalError(w, err)
+			h.serviceError(w, err)
 			return
 		}
 
@@ -115,54 +98,32 @@ func (h *handler) createTransaction(
 		return
 	}
 
-	tx := request.ToDomain()
-
-	if err := tx.Validate(); err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-
-	saved, err := h.store.AddTransaction(tx)
-
-	if errors.Is(err, ledger.ErrBudgetExceeded) {
-		writeError(
-			w,
-			http.StatusConflict,
-			"budget exceeded",
-		)
-		return
-	}
-
-	if err != nil {
-		h.internalError(w, err)
-		return
-	}
-
-	writeJSON(
-		w,
-		http.StatusCreated,
-		transactionResponse(saved),
+	saved, err := h.service.AddTransaction(
+		r.Context(),
+		request.ToDomain(),
 	)
+	if err != nil {
+		h.serviceError(w, err)
+		return
+	}
+
+	writeJSON(w, http.StatusCreated, transactionResponse(saved))
 }
 
-func (h *handler) listTransactions(w http.ResponseWriter) {
-	items, err := h.store.ListTransactions()
+func (h *handler) listTransactions(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
+	items, err := h.service.ListTransactions(r.Context())
 	if err != nil {
-		h.internalError(w, err)
+		h.serviceError(w, err)
 		return
 	}
 
-	response := make(
-		[]TransactionResponse,
-		0,
-		len(items),
-	)
+	response := make([]TransactionResponse, 0, len(items))
 
 	for _, tx := range items {
-		response = append(
-			response,
-			transactionResponse(tx),
-		)
+		response = append(response, transactionResponse(tx))
 	}
 
 	writeJSON(w, http.StatusOK, response)
@@ -181,37 +142,28 @@ func (h *handler) createBudget(
 
 	b := request.ToDomain()
 
-	if err := b.Validate(); err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+	if err := h.service.SetBudget(r.Context(), b); err != nil {
+		h.serviceError(w, err)
 		return
 	}
 
-	if err := h.store.SetBudget(b); err != nil {
-		h.internalError(w, err)
-		return
-	}
-
-	writeJSON(
-		w,
-		http.StatusCreated,
-		budgetResponse(b),
-	)
+	writeJSON(w, http.StatusCreated, budgetResponse(b))
 }
 
-func (h *handler) listBudgets(w http.ResponseWriter) {
-	items, err := h.store.ListBudgets()
+func (h *handler) listBudgets(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
+	items, err := h.service.ListBudgets(r.Context())
 	if err != nil {
-		h.internalError(w, err)
+		h.serviceError(w, err)
 		return
 	}
 
 	response := make([]BudgetResponse, 0, len(items))
 
 	for _, b := range items {
-		response = append(
-			response,
-			budgetResponse(b),
-		)
+		response = append(response, budgetResponse(b))
 	}
 
 	writeJSON(w, http.StatusOK, response)
@@ -222,11 +174,7 @@ func readJSON(
 	r *http.Request,
 	destination any,
 ) error {
-	r.Body = http.MaxBytesReader(
-		w,
-		r.Body,
-		maxBodyBytes,
-	)
+	r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
 	defer r.Body.Close()
 
 	decoder := json.NewDecoder(r.Body)
@@ -247,49 +195,39 @@ func readJSON(
 	return nil
 }
 
-func (h *handler) internalError(
-	w http.ResponseWriter,
-	err error,
-) {
-	h.logger.Printf("internal error: %v", err)
+func (h *handler) serviceError(w http.ResponseWriter, err error) {
+	var invalid *ledger.ValidationError
 
-	writeError(
-		w,
-		http.StatusInternalServerError,
-		"internal server error",
-	)
+	switch {
+	case errors.As(err, &invalid):
+		writeError(w, http.StatusBadRequest, invalid.Error())
+
+	case errors.Is(err, ledger.ErrInvalidPeriod):
+		writeError(w, http.StatusBadRequest, err.Error())
+
+	case errors.Is(err, ledger.ErrBudgetExceeded):
+		writeError(w, http.StatusConflict, "budget exceeded")
+
+	default:
+		h.logger.Printf("internal error: %v", err)
+		writeError(
+			w,
+			http.StatusInternalServerError,
+			"internal server error",
+		)
+	}
 }
 
-func methodNotAllowed(
-	w http.ResponseWriter,
-	allow string,
-) {
+func methodNotAllowed(w http.ResponseWriter, allow string) {
 	w.Header().Set("Allow", allow)
-
-	writeError(
-		w,
-		http.StatusMethodNotAllowed,
-		"method not allowed",
-	)
+	writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 }
 
-func writeError(
-	w http.ResponseWriter,
-	status int,
-	message string,
-) {
-	writeJSON(
-		w,
-		status,
-		map[string]string{"error": message},
-	)
+func writeError(w http.ResponseWriter, status int, message string) {
+	writeJSON(w, status, map[string]string{"error": message})
 }
 
-func writeJSON(
-	w http.ResponseWriter,
-	status int,
-	value any,
-) {
+func writeJSON(w http.ResponseWriter, status int, value any) {
 	w.Header().Set("Content-Type", jsonContentType)
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(value)
